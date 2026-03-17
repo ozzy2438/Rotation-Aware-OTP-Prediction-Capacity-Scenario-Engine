@@ -1,0 +1,273 @@
+name: Weekly OTP Retrain Pipeline
+
+on:
+  schedule:
+    # Every Monday at 03:00 UTC
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Reason for manual trigger"
+        required: false
+        default: "Manual retrain"
+
+env:
+  PYTHON_VERSION: "3.11"
+  MLFLOW_TRACKING_URI: "sqlite:///mlruns/mlflow.db"
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # 1. Data Validation
+  # ─────────────────────────────────────────────────────────────────────────────
+  validate-data:
+    name: Data Validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate synthetic data
+        run: python main.py generate-data
+
+      - name: Run ETL pipeline
+        run: python main.py run-etl
+
+      - name: Validate data schema and quality
+        run: |
+          python - <<'EOF'
+          import pandas as pd
+          import sys
+
+          print("Validating processed data ...")
+
+          flights = pd.read_parquet("data/processed/flights_processed.parquet")
+          capacity = pd.read_parquet("data/processed/capacity_processed.parquet")
+
+          # Schema checks
+          required_cols = ["Route", "Year", "Month", "ArrDel15", "ArrDelay", "Cancelled"]
+          missing = [c for c in required_cols if c not in flights.columns]
+          if missing:
+              print(f"FAIL: Missing columns: {missing}")
+              sys.exit(1)
+
+          # Null rate check (target must be clean)
+          null_rate = flights["ArrDel15"].isna().mean()
+          if null_rate > 0.05:
+              print(f"FAIL: ArrDel15 null rate too high: {null_rate:.1%}")
+              sys.exit(1)
+
+          # Route coverage
+          routes = flights["Route"].nunique()
+          if routes < 8:
+              print(f"FAIL: Only {routes} routes found, expected >= 8")
+              sys.exit(1)
+
+          # Positive rate sanity (15–40% delay rate expected)
+          operated = flights[flights["Cancelled"] == 0]
+          delay_rate = operated["ArrDel15"].mean()
+          if not (0.10 <= delay_rate <= 0.50):
+              print(f"WARN: Delay rate {delay_rate:.1%} outside expected range [10%–50%]")
+
+          print(f"  Flights: {len(flights):,} rows | Routes: {routes} | Delay rate: {delay_rate:.1%}")
+          print(f"  Capacity: {len(capacity):,} rows")
+          print("Data validation PASSED.")
+          EOF
+
+      - name: Upload processed data artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: processed-data
+          path: data/processed/
+          retention-days: 7
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # 2. Model Training
+  # ─────────────────────────────────────────────────────────────────────────────
+  train-models:
+    name: Train & Evaluate Models
+    needs: validate-data
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download processed data
+        uses: actions/download-artifact@v4
+        with:
+          name: processed-data
+          path: data/processed/
+
+      - name: Train OTP predictor + demand forecaster
+        run: python main.py train-models
+
+      - name: Evaluate model quality gate
+        run: |
+          python - <<'EOF'
+          import json, sys
+          from pathlib import Path
+
+          meta_path = Path("data/models/otp_predictor_meta.json")
+          if not meta_path.exists():
+              print("FAIL: Model metadata not found")
+              sys.exit(1)
+
+          meta = json.loads(meta_path.read_text())
+          auc  = meta.get("eval_results", {}).get("auc_roc", 0)
+          f1   = meta.get("eval_results", {}).get("f1_score", 0)
+
+          print(f"Model quality gate — AUC-ROC: {auc:.4f} | F1: {f1:.4f}")
+
+          # Hard gates
+          if auc < 0.75:
+              print(f"FAIL: AUC-ROC {auc:.4f} below minimum threshold 0.75")
+              sys.exit(1)
+          if f1 < 0.40:
+              print(f"FAIL: F1 {f1:.4f} below minimum threshold 0.40")
+              sys.exit(1)
+
+          print("Quality gate PASSED — model promoted.")
+          EOF
+
+      - name: Upload trained model artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: trained-models
+          path: |
+            data/models/otp_predictor.pkl
+            data/models/otp_predictor_meta.json
+            data/models/demand_forecasts.parquet
+          retention-days: 30
+
+      - name: Upload MLflow DB
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlflow-db
+          path: mlruns/
+          retention-days: 90
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # 3. Regression Test
+  # ─────────────────────────────────────────────────────────────────────────────
+  regression-test:
+    name: Regression & Unit Tests
+    needs: train-models
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download processed data
+        uses: actions/download-artifact@v4
+        with:
+          name: processed-data
+          path: data/processed/
+
+      - name: Download trained models
+        uses: actions/download-artifact@v4
+        with:
+          name: trained-models
+          path: data/models/
+
+      - name: Run test suite
+        run: pytest tests/ -v --tb=short -q
+
+      - name: Rotation-chain smoke test
+        run: |
+          python - <<'EOF'
+          from src.models.otp_predictor import OTPPredictor
+          from pathlib import Path
+
+          predictor = OTPPredictor.load(Path("data/models"))
+
+          # Smoke test: clear-day early-morning flight
+          result_clear = predictor.predict_single({
+              "hour_of_day": 7, "day_of_week": 1, "month": 3,
+              "quarter": 1, "is_weekend": 0, "is_monday": 0, "is_friday": 0,
+              "is_holiday": 0, "is_holiday_window": 0,
+              "is_early_morning": 0, "is_peak_morning": 1, "is_afternoon": 0, "is_evening": 0,
+              "is_summer": 0, "is_hurricane_season": 0, "is_winter": 0,
+              "hour_sin": 0.0, "hour_cos": 1.0, "month_sin": 0.5, "month_cos": 0.87,
+              "dow_sin": 0.78, "dow_cos": 0.62,
+              "route_distance": 662, "route_otp_baseline": 0.78,
+              "is_high_congestion_dest": 1, "is_long_haul": 0, "is_short_haul": 0,
+              "distance_normalised": 0.28,
+              "weather_severity": 0.5, "thunderstorm_flag": 0, "precipitation_flag": 0,
+              "low_visibility_flag": 0, "wind_gust_flag": 0, "wind_speed": 8.0,
+              "high_wind_flag": 0, "rolling_avg_dep_delay": 4.0, "prev_tail_dep_delay": 0.0,
+              "legs_today_before": 0, "cumulative_tail_delay_today": 0.0,
+              "prev_tail_arr_delay": 0.0, "hours_since_last_flight": 8.0,
+              "quick_turn_flag": 0, "tail_delay_streak": 0,
+          })
+
+          # Smoke test: severe weather evening flight
+          result_storm = predictor.predict_single({
+              "hour_of_day": 19, "day_of_week": 4, "month": 8,
+              "quarter": 3, "is_weekend": 0, "is_monday": 0, "is_friday": 1,
+              "is_holiday": 0, "is_holiday_window": 1,
+              "is_early_morning": 0, "is_peak_morning": 0, "is_afternoon": 0, "is_evening": 1,
+              "is_summer": 1, "is_hurricane_season": 1, "is_winter": 0,
+              "hour_sin": -0.71, "hour_cos": -0.71, "month_sin": 0.0, "month_cos": -1.0,
+              "dow_sin": -0.43, "dow_cos": 0.22,
+              "route_distance": 662, "route_otp_baseline": 0.78,
+              "is_high_congestion_dest": 1, "is_long_haul": 0, "is_short_haul": 0,
+              "distance_normalised": 0.28,
+              "weather_severity": 8.5, "thunderstorm_flag": 1, "precipitation_flag": 1,
+              "low_visibility_flag": 1, "wind_gust_flag": 1, "wind_speed": 28.0,
+              "high_wind_flag": 1, "rolling_avg_dep_delay": 35.0, "prev_tail_dep_delay": 42.0,
+              "legs_today_before": 3, "cumulative_tail_delay_today": 55.0,
+              "prev_tail_arr_delay": 38.0, "hours_since_last_flight": 0.4,
+              "quick_turn_flag": 1, "tail_delay_streak": 2,
+          })
+
+          print(f"Clear-day flight:   P(delay)={result_clear['delay_probability']:.3f}  [{result_clear['risk_level']}]")
+          print(f"Storm evening flight: P(delay)={result_storm['delay_probability']:.3f}  [{result_storm['risk_level']}]")
+
+          assert result_storm["delay_probability"] > result_clear["delay_probability"], \
+              "Storm flight should have higher delay probability than clear-day flight"
+          print("Regression test PASSED.")
+          EOF
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # 4. Pipeline Summary
+  # ─────────────────────────────────────────────────────────────────────────────
+  summary:
+    name: Pipeline Summary
+    needs: regression-test
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Print pipeline status
+        run: |
+          echo "=========================================="
+          echo "  Spirit Airlines FLL Hub — Retrain Pipeline"
+          echo "  Triggered: ${{ github.event_name }}"
+          echo "  Date: $(date -u '+%Y-%m-%d %H:%M UTC')"
+          echo "=========================================="
+          echo "  validate-data : ${{ needs.validate-data.result }}"
+          echo "  train-models  : ${{ needs.train-models.result }}"
+          echo "  regression    : ${{ needs.regression-test.result }}"
+          echo "=========================================="

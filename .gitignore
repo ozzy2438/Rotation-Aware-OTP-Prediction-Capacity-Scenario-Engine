@@ -1,0 +1,46 @@
+# Environment & secrets
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+
+# Data files (large, not for version control)
+data/raw/
+data/processed/
+data/models/
+data/*.duckdb
+
+# MLflow local store
+mlruns/
+
+# Generated exports
+exports/
+
+# Stale Power BI files (superseded by powerbi_export.py)
+Power_BI_Dashboard_Summary.txt
+Power_BI_Data_Dictionary.xlsx
+Sample_Power_BI_Data.xlsx
+FILE_INDEX.txt
+
+# Unnamed notebooks
+Untitled.ipynb
+
+# Test cache
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# Notebooks checkpoints
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
