@@ -4,13 +4,19 @@
 > Period: 2023 Q3 – 2024 Q1 · Data: 2022–2024 (synthetic, BTS T-100 statistical properties)
 
 ---
+## Streamlit Dashboard Video
+
+
+
+https://github.com/user-attachments/assets/0aa2bc89-b65f-4937-b082-fead1dbf85ec
+
 
 ## Business Problem
 
 The client's Fort Lauderdale hub operated 10 routes with degrading on-time performance and no
 quantitative framework for evaluating schedule change decisions. Three specific gaps:
 
-1. **No delay prediction** — operations team couldn't anticipate high-risk flights before departure
+1. **No delay prediction** — opethe rations team couldn't anticipate high-risk flights before departure
 2. **No capacity scenario tooling** — schedule additions were evaluated by intuition, not simulation
 3. **No demand visibility** — forward passenger volumes were unavailable for network planning
 
@@ -95,8 +101,7 @@ Raw Data (CSV)
 
 - **`tracking.py`** — MLflow experiment tracker (SQLite backend, no server required)
   - Auto-logs: hyperparameters · AUC-ROC · F1 · feature count · model artifact
-  - `get_best_run()` queries registry for champion model
-
+  - `get_best_run()` queries the registry for the champion
 ### `src/integrations/`
 
 - **`weather_api.py`** — OpenWeatherMap client for 11 airport locations
